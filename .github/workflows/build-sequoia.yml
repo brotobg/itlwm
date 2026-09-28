@@ -1,4 +1,4 @@
-name: Deep Validate AirportItlwm on Sequoia
+name: Final Link Validate AirportItlwm Sequoia
 
 on:
   workflow_dispatch:
@@ -8,16 +8,14 @@ jobs:
     runs-on: macos-15-intel
 
     steps:
-      - name: Checkout fork
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Clone MacKernelSDK
         run: |
-          rm -rf MacKernelSDK
-          git clone --depth=1 \
-            https://github.com/acidanthera/MacKernelSDK.git
+          git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
 
-      - name: Patch IO80211Controller postMessage ABI
+      - name: Patch postMessage for Sequoia
         run: |
           python3 <<'PY'
           from pathlib import Path
@@ -25,54 +23,25 @@ jobs:
           p = Path("include/Airport/IO80211ControllerV2.h")
           s = p.read_text()
 
-          old_variants = [
-              "virtual void postMessage(UInt,void *,unsigned long,UInt,void *);",
-              "virtual void postMessage(UInt, void *, unsigned long, UInt, void *);",
-          ]
+          old1 = "virtual void postMessage(UInt,void *,unsigned long,UInt,void *);"
+          old2 = "virtual void postMessage(UInt, void *, unsigned long, UInt, void *);"
 
           new = (
               "virtual void postMessage("
               "IO80211SkywalkInterface *, UInt, void *, unsigned long, bool);"
           )
 
-          found = False
-
-          for old in old_variants:
-              if old in s:
-                  s = s.replace(old, new)
-                  found = True
-                  break
-
-          if not found:
-              raise SystemExit(
-                  "Old IO80211Controller::postMessage signature not found"
-              )
+          if old1 in s:
+              s = s.replace(old1, new)
+          elif old2 in s:
+              s = s.replace(old2, new)
+          else:
+              raise SystemExit("Old postMessage signature not found")
 
           p.write_text(s)
-
-          print("Applied Sequoia ABI patch:")
-          print(new)
           PY
 
-      - name: Show environment
-        run: |
-          echo "===== macOS ====="
-          sw_vers
-
-          echo "===== Xcode ====="
-          xcodebuild -version
-
-          echo "===== SDK ====="
-          xcrun --show-sdk-version
-          xcrun --show-sdk-path
-
-          echo "===== Runner architecture ====="
-          uname -m
-
-          echo "===== kmutil ====="
-          kmutil --help | head -30 || true
-
-      - name: Build AirportItlwm
+      - name: Build
         run: |
           set -o pipefail
 
@@ -86,173 +55,83 @@ jobs:
             MACOSX_DEPLOYMENT_TARGET=15.0 \
             2>&1 | tee xcodebuild.log
 
-      - name: Locate AirportItlwm
+      - name: Locate kext
         run: |
-          KEXT=$(find build \
-            -type d \
-            -name "AirportItlwm.kext" \
-            | head -1)
-
-          if [ -z "$KEXT" ]; then
-            echo "AirportItlwm.kext not found"
-            exit 1
-          fi
-
+          KEXT=$(find build -type d -name "AirportItlwm.kext" | head -1)
           BIN="$KEXT/Contents/MacOS/AirportItlwm"
-
-          if [ ! -f "$BIN" ]; then
-            echo "AirportItlwm executable not found"
-            exit 1
-          fi
 
           echo "KEXT=$KEXT" >> "$GITHUB_ENV"
           echo "BIN=$BIN" >> "$GITHUB_ENV"
 
-          echo "Kext:"
-          echo "$KEXT"
-
-          echo "Binary:"
-          echo "$BIN"
-
-      - name: Prepare diagnostics directory
-        run: |
-          mkdir -p diagnostics
-
-      - name: Inspect binary
-        run: |
-          {
-            echo "===== FILE ====="
-            file "$BIN"
-
-            echo
-            echo "===== LIPO ====="
-            lipo -info "$BIN"
-
-            echo
-            echo "===== INFO.PLIST ====="
-            plutil -p "$KEXT/Contents/Info.plist"
-
-          } | tee diagnostics/binary-info.txt
-
-      - name: Inspect undefined symbols
-        run: |
-          nm -u "$BIN" \
-            | tee diagnostics/undefined-symbols.txt
-
-          echo "===== postMessage =====" \
-            | tee diagnostics/postmessage.txt
-
-          nm -u "$BIN" \
-            | grep -i postMessage \
-            | tee -a diagnostics/postmessage.txt \
-            || true
-
-          echo "===== IO80211Controller =====" \
-            | tee diagnostics/io80211controller.txt
-
-          nm -u "$BIN" \
-            | grep -i IO80211Controller \
-            | tee -a diagnostics/io80211controller.txt \
-            || true
-
-          echo "===== IO80211SkywalkInterface =====" \
-            | tee diagnostics/skywalk.txt
-
-          nm -u "$BIN" \
-            | grep -i IO80211SkywalkInterface \
-            | tee -a diagnostics/skywalk.txt \
-            || true
-
-          echo "===== IO80211InfraInterface =====" \
-            | tee diagnostics/infra.txt
-
-          nm -u "$BIN" \
-            | grep -i IO80211InfraInterface \
-            | tee -a diagnostics/infra.txt \
-            || true
+          test -d "$KEXT"
+          test -f "$BIN"
 
       - name: Prepare permissions
         run: |
           sudo chown -R root:wheel "$KEXT"
-
-          sudo find "$KEXT" \
-            -type d \
-            -exec chmod 755 {} \;
-
-          sudo find "$KEXT" \
-            -type f \
-            -exec chmod 644 {} \;
-
+          sudo find "$KEXT" -type d -exec chmod 755 {} \;
+          sudo find "$KEXT" -type f -exec chmod 644 {} \;
           sudo chmod 755 "$BIN"
 
-      - name: Resolve kext libraries
+      - name: Show unresolved kernel symbols
         continue-on-error: true
         run: |
-          echo "===== KMUTIL LIBRARIES =====" \
-            | tee diagnostics/kmutil-libraries.txt
+          mkdir -p diagnostics
+
+          echo "===== UNRESOLVED SYMBOLS =====" \
+            | tee diagnostics/unresolved.txt
 
           sudo kmutil libraries \
+            -z \
             -p "$KEXT" \
-            --xml \
-            2>&1 \
-            | tee -a diagnostics/kmutil-libraries.txt
+            --undef-symbols \
+            2>&1 | tee -a diagnostics/unresolved.txt
 
-      - name: Run deep kmutil diagnostics
+      - name: Show all symbol resolutions
         continue-on-error: true
         run: |
-          echo "===== KMUTIL PRINT-DIAGNOSTICS =====" \
-            | tee diagnostics/kmutil-print-diagnostics.txt
+          sudo kmutil libraries \
+            -z \
+            -p "$KEXT" \
+            --all-symbols \
+            2>&1 | tee diagnostics/all-symbols.txt
 
+      - name: Deep diagnostics without authentication
+        continue-on-error: true
+        run: |
           sudo kmutil print-diagnostics \
+            -z \
             -p "$KEXT" \
             -D \
             -a x86_64 \
-            2>&1 \
-            | tee -a diagnostics/kmutil-print-diagnostics.txt
+            2>&1 | tee diagnostics/deep-link-test.txt
 
-      - name: Run normal load diagnostic
-        continue-on-error: true
-        run: |
-          echo "===== KMUTIL LOAD =====" \
-            | tee diagnostics/kmutil-load.txt
-
-          sudo kmutil load \
-            -p "$KEXT" \
-            2>&1 \
-            | tee -a diagnostics/kmutil-load.txt
-
-      - name: Search critical failures
+      - name: Extract important results
         if: always()
         run: |
           {
-            echo "===== CRITICAL FAILURE SEARCH ====="
+            echo "===== FAILURES ====="
 
             grep -RniE \
-              "Failed to bind|could not find a kext which exports|undefined symbol|Dependency Resolution|dependency.*fail|KMErrorDomain|Code=30|Code=31|not approved|reboot required" \
+              "not found|Failed to bind|undefined|multiply-defined|dependency.*fail|cannot link|linking failed|error:" \
               diagnostics \
               || true
 
-          } | tee diagnostics/critical-results.txt
+            echo
+            echo "===== postMessage ====="
 
-      - name: Save build information
-        if: always()
-        run: |
-          cp xcodebuild.log diagnostics/ || true
+            nm -u "$BIN" | grep -i postMessage || true
 
-          find build \
-            -type d \
-            -name "*.kext" \
-            -print \
-            > diagnostics/generated-kexts.txt \
-            || true
+          } | tee diagnostics/summary.txt
 
-      - name: Package results
+      - name: Package
         if: always()
         run: |
           mkdir -p artifact
 
-          cp -R "$KEXT" artifact/ || true
+          cp -R "$KEXT" artifact/
           cp -R diagnostics artifact/
+          cp xcodebuild.log artifact/
 
           ditto \
             -c \
@@ -260,11 +139,11 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             artifact \
-            AirportItlwm-Sequoia-deep-validation.zip
+            AirportItlwm-Sequoia-final-validation.zip
 
-      - name: Upload results
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: AirportItlwm-Sequoia-deep-validation
-          path: AirportItlwm-Sequoia-deep-validation.zip
+          name: AirportItlwm-Sequoia-final-validation
+          path: AirportItlwm-Sequoia-final-validation.zip
