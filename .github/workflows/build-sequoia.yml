@@ -114,9 +114,6 @@ jobs:
                   )
           PY
 
-          echo "Selected mode: ${{ steps.detect.outputs.mode }}"
-          echo "Selected name: ${{ steps.detect.outputs.name }}"
-
       - name: Build native AirportItlwm
         run: |
           set -o pipefail
