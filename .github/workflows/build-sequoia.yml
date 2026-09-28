@@ -1,0 +1,65 @@
+name: Build AirportItlwm Sequoia
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Apply Sequoia PR 1054
+        run: |
+          curl -L https://github.com/OpenIntelWireless/itlwm/pull/1054.patch -o /tmp/sequoia.patch
+          git apply --check /tmp/sequoia.patch
+          git apply /tmp/sequoia.patch
+
+      - name: Clone MacKernelSDK
+        run: |
+          git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
+
+      - name: Show Xcode environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --show-sdk-version
+
+      - name: List schemes
+        run: |
+          xcodebuild -project itlwm.xcodeproj -list
+
+      - name: Build AirportItlwm
+        run: |
+          xcodebuild \
+            -project itlwm.xcodeproj \
+            -scheme "AirportItlwm (all)" \
+            -configuration Debug \
+            -derivedDataPath build \
+            ARCHS=x86_64 \
+            ONLY_ACTIVE_ARCH=YES
+
+      - name: Find built kexts
+        run: |
+          find build -type d -name "*.kext" -print
+
+      - name: Check old postMessage symbol
+        run: |
+          find build -path "*/AirportItlwm*.kext/Contents/MacOS/*" -type f -print -exec nm -u {} \; \
+            | tee postmessage-check.txt
+          grep -i postMessage postmessage-check.txt || true
+
+      - name: Package result
+        run: |
+          mkdir -p artifacts
+          find build -type d -name "AirportItlwm*.kext" -exec cp -R {} artifacts/ \;
+          cp postmessage-check.txt artifacts/
+          ditto -c -k --sequesterRsrc --keepParent artifacts AirportItlwm-Sequoia-native.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirportItlwm-Sequoia-native
+          path: AirportItlwm-Sequoia-native.zip
