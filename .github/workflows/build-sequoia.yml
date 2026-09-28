@@ -1,10 +1,10 @@
-name: Inspect AirportItlwm Sequoia Project
+name: Export Sequoia Port Sources
 
 on:
   workflow_dispatch:
 
 jobs:
-  inspect:
+  export:
     runs-on: macos-15-intel
 
     steps:
@@ -19,57 +19,37 @@ jobs:
             +refs/pull/1055/head:refs/remotes/upstream/pr1055
           git checkout --detach refs/remotes/upstream/pr1055
 
-      - name: Show targets and schemes
+      - name: Collect Sequoia port sources
         run: |
-          xcodebuild \
-            -project itlwm.xcodeproj \
-            -list \
-            -json \
-            | tee project-list.json
+          mkdir -p export/AirportItlwm
+          mkdir -p export/include/Airport
+          mkdir -p export/Project
 
-      - name: Find Sequoia references in project
-        run: |
-          echo "===== SEQUOIA FILE REFERENCES =====" \
-            > sequoia-project.txt
+          cp itlwm.xcodeproj/project.pbxproj \
+             export/Project/
 
-          grep -n -B 15 -A 25 \
-            "AirportItlwm_Sequoia" \
-            itlwm.xcodeproj/project.pbxproj \
-            >> sequoia-project.txt || true
+          cp -R itlwm.xcodeproj/xcshareddata \
+             export/Project/ 2>/dev/null || true
 
-          echo "" >> sequoia-project.txt
-          echo "===== BUILD PHASE REFERENCES =====" \
-            >> sequoia-project.txt
+          cp AirportItlwm/*.cpp \
+             export/AirportItlwm/ || true
 
-          grep -n -B 30 -A 50 \
-            "Sources" \
-            itlwm.xcodeproj/project.pbxproj \
-            >> sequoia-project.txt || true
+          cp AirportItlwm/*.hpp \
+             export/AirportItlwm/ || true
 
-      - name: List relevant target names
-        run: |
-          grep -n \
-            "name = AirportItlwm" \
-            itlwm.xcodeproj/project.pbxproj \
-            | tee airport-targets.txt || true
+          cp AirportItlwm/*.plist \
+             export/AirportItlwm/ || true
 
-      - name: Show Sequoia source headers
-        run: |
-          sed -n '1,240p' \
-            AirportItlwm/AirportItlwm_Sequoia.hpp \
-            > AirportItlwm_Sequoia_hpp.txt
+          cp include/Airport/IO80211*.h \
+             export/include/Airport/ || true
 
-          sed -n '1,320p' \
-            AirportItlwm/AirportItlwm_Sequoia.cpp \
-            > AirportItlwm_Sequoia_cpp.txt
+          cp include/Airport/Apple80211* \
+             export/include/Airport/ 2>/dev/null || true
 
-      - name: Upload inspection
+          find export -type f | sort > export/file-list.txt
+
+      - name: Upload sources
         uses: actions/upload-artifact@v4
         with:
-          name: AirportItlwm-Sequoia-project-inspection
-          path: |
-            project-list.json
-            sequoia-project.txt
-            airport-targets.txt
-            AirportItlwm_Sequoia_hpp.txt
-            AirportItlwm_Sequoia_cpp.txt
+          name: AirportItlwm-Sequoia-source-snapshot
+          path: export
