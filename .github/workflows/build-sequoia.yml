@@ -21,7 +21,7 @@ jobs:
 
           git checkout --detach refs/remotes/upstream/pr1055
 
-          echo "===== COMMIT ====="
+          echo "===== CURRENT COMMIT ====="
           git log -1 --oneline
 
       - name: Clone MacKernelSDK
@@ -32,105 +32,166 @@ jobs:
 
       - name: Show environment
         run: |
-          echo "===== macOS ====="
           sw_vers
-
-          echo "===== XCODE ====="
           xcodebuild -version
-
-          echo "===== SDK ====="
           xcrun --show-sdk-version
-
-          echo "===== ARCH ====="
           uname -m
 
-      - name: Inspect Xcode project
+      - name: Read Xcode project structure
         run: |
-          echo "===== PROJECT LIST ====="
-
           xcodebuild \
             -project itlwm.xcodeproj \
             -list \
-            | tee project-list.txt
+            -json \
+            > project-list.json
 
-          echo ""
-          echo "===== SEQUOIA PROJECT REFERENCES ====="
+          cat project-list.json
 
-          grep -Rni \
-            "Sequoia\|Tahoe\|AirportItlwm_Sequoia" \
-            AirportItlwm \
-            itlwm.xcodeproj \
-            2>/dev/null \
-            | tee sequoia-project-references.txt \
-            || true
-
-      - name: Show AirportItlwm build settings
+      - name: Detect best AirportItlwm target
+        id: detect
         run: |
-          xcodebuild \
-            -project itlwm.xcodeproj \
-            -scheme "AirportItlwm" \
-            -configuration Debug \
-            -showBuildSettings \
-            | tee airport-build-settings.txt
+          python3 <<'PY'
+          import json
+          import os
+          import sys
 
-      - name: Build AirportItlwm only
+          with open("project-list.json") as f:
+              data = json.load(f)
+
+          project = data.get("project", {})
+          targets = project.get("targets", [])
+          schemes = project.get("schemes", [])
+
+          print("===== TARGETS =====")
+          for t in targets:
+              print(t)
+
+          print("===== SCHEMES =====")
+          for s in schemes:
+              print(s)
+
+          # Priority:
+          # 1. target/scheme containing Sequoia
+          # 2. target/scheme containing Tahoe
+          # 3. AirportItlwm target, excluding old OS-specific targets
+          candidates = []
+
+          for t in targets:
+              low = t.lower()
+              if "airportitlwm" in low and "sequoia" in low:
+                  candidates.append(("target", t, 100))
+              elif "airportitlwm" in low and "tahoe" in low:
+                  candidates.append(("target", t, 90))
+              elif (
+                  "airportitlwm" in low
+                  and "ventura" not in low
+                  and "monterey" not in low
+                  and "sonoma" not in low
+              ):
+                  candidates.append(("target", t, 50))
+
+          for s in schemes:
+              low = s.lower()
+              if "airportitlwm" in low and "sequoia" in low:
+                  candidates.append(("scheme", s, 100))
+              elif "airportitlwm" in low and "tahoe" in low:
+                  candidates.append(("scheme", s, 90))
+              elif (
+                  "airportitlwm" in low
+                  and "ventura" not in low
+                  and "monterey" not in low
+                  and "sonoma" not in low
+                  and "(all)" not in low
+              ):
+                  candidates.append(("scheme", s, 50))
+
+          if not candidates:
+              print("No suitable native AirportItlwm target/scheme found.")
+              sys.exit(2)
+
+          candidates.sort(key=lambda x: x[2], reverse=True)
+          mode, name, score = candidates[0]
+
+          print(f"SELECTED: {mode} -> {name}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"mode={mode}\n")
+              out.write(f"name={name}\n")
+          PY
+
+      - name: Build native AirportItlwm
         run: |
           set -o pipefail
 
-          xcodebuild \
-            -project itlwm.xcodeproj \
-            -scheme "AirportItlwm" \
-            -configuration Debug \
-            -derivedDataPath build \
-            ARCHS=x86_64 \
-            ONLY_ACTIVE_ARCH=YES \
-            MACOSX_DEPLOYMENT_TARGET=15.0 \
-            2>&1 | tee xcodebuild.log
+          MODE="${{ steps.detect.outputs.mode }}"
+          NAME="${{ steps.detect.outputs.name }}"
+
+          echo "Building using:"
+          echo "Mode: $MODE"
+          echo "Name: $NAME"
+
+          if [ "$MODE" = "target" ]; then
+            xcodebuild \
+              -project itlwm.xcodeproj \
+              -target "$NAME" \
+              -configuration Debug \
+              ARCHS=x86_64 \
+              ONLY_ACTIVE_ARCH=YES \
+              MACOSX_DEPLOYMENT_TARGET=15.0 \
+              2>&1 | tee xcodebuild.log
+          else
+            xcodebuild \
+              -project itlwm.xcodeproj \
+              -scheme "$NAME" \
+              -configuration Debug \
+              -derivedDataPath build \
+              ARCHS=x86_64 \
+              ONLY_ACTIVE_ARCH=YES \
+              MACOSX_DEPLOYMENT_TARGET=15.0 \
+              2>&1 | tee xcodebuild.log
+          fi
 
       - name: Extract diagnostics
         if: always()
         run: |
           grep -n -E \
-            "error:|warning:|undefined symbol|BUILD FAILED|AirportItlwm_Sequoia|target '" \
+            "error:|warning:|undefined symbol|BUILD FAILED|target '|scheme '" \
             xcodebuild.log \
             > compiler-errors.txt || true
 
-          echo "===== IMPORTANT DIAGNOSTICS ====="
           cat compiler-errors.txt || true
 
       - name: Find generated kexts
         if: always()
         run: |
-          find build \
+          find . \
             -type d \
-            -name "*.kext" \
+            -name "AirportItlwm*.kext" \
             -print \
-            | tee generated-kexts.txt \
-            || true
+            | tee generated-kexts.txt || true
 
       - name: Validate binaries
         if: success()
         run: |
           mkdir -p analysis
 
-          find build \
+          find . \
             -path "*/AirportItlwm*.kext/Contents/MacOS/*" \
             -type f \
             -print \
             > analysis/binaries.txt
 
           while IFS= read -r BIN; do
-
-            echo "======================================"
+            echo "================================"
             echo "$BIN"
-            echo "======================================"
+            echo "================================"
 
             file "$BIN"
 
-            echo "--- postMessage ---"
+            echo "--- postMessage symbols ---"
             nm -u "$BIN" | grep -i postMessage || true
 
-            echo "--- IO80211 ---"
+            echo "--- IO80211 symbols ---"
             nm -u "$BIN" | grep -i IO80211 | head -100 || true
 
           done < analysis/binaries.txt \
@@ -141,16 +202,15 @@ jobs:
         run: |
           mkdir -p artifacts
 
-          find build \
-            -type d \
-            -name "AirportItlwm*.kext" \
-            -exec cp -R {} artifacts/ \;
+          while IFS= read -r KEXT; do
+            cp -R "$KEXT" artifacts/
+          done < <(
+            find . -type d -name "AirportItlwm*.kext"
+          )
 
+          cp project-list.json artifacts/
           cp xcodebuild.log artifacts/
           cp compiler-errors.txt artifacts/
-          cp project-list.txt artifacts/
-          cp airport-build-settings.txt artifacts/
-          cp sequoia-project-references.txt artifacts/
           cp generated-kexts.txt artifacts/
           cp -R analysis artifacts/
 
@@ -169,15 +229,13 @@ jobs:
           name: AirportItlwm-Sequoia-native
           path: AirportItlwm-Sequoia-native.zip
 
-      - name: Upload failed build diagnostics
+      - name: Upload failed diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: AirportItlwm-Sequoia-build-logs
           path: |
+            project-list.json
             xcodebuild.log
             compiler-errors.txt
-            project-list.txt
-            airport-build-settings.txt
-            sequoia-project-references.txt
             generated-kexts.txt
