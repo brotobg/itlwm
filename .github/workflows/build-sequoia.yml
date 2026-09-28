@@ -11,7 +11,7 @@ jobs:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Fetch native Sequoia PR 1055
+      - name: Fetch Sequoia Tahoe PR 1055
         run: |
           git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/OpenIntelWireless/itlwm.git
@@ -21,18 +21,16 @@ jobs:
 
           git checkout --detach refs/remotes/upstream/pr1055
 
-          echo "===== CURRENT COMMIT ====="
+          echo "===== COMMIT ====="
           git log -1 --oneline
-
-          echo "===== CURRENT BRANCH STATE ====="
-          git status --short
 
       - name: Clone MacKernelSDK
         run: |
           rm -rf MacKernelSDK
-          git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
+          git clone --depth=1 \
+            https://github.com/acidanthera/MacKernelSDK.git
 
-      - name: Show build environment
+      - name: Show environment
         run: |
           echo "===== macOS ====="
           sw_vers
@@ -42,127 +40,75 @@ jobs:
 
           echo "===== SDK ====="
           xcrun --show-sdk-version
-          xcrun --show-sdk-path
 
           echo "===== ARCH ====="
           uname -m
 
-      - name: Inspect Sequoia project
+      - name: Inspect Xcode project
         run: |
-          echo "===== XCODE PROJECT ====="
-          xcodebuild -project itlwm.xcodeproj -list
+          echo "===== PROJECT LIST ====="
 
-          echo "===== SEQUOIA REFERENCES ====="
-          grep -Rni "Sequoia" \
-            AirportItlwm \
-            itlwm.xcodeproj/project.pbxproj \
-            2>/dev/null | head -150 || true
-
-      - name: Detect Sequoia target
-        id: detect
-        run: |
           xcodebuild \
             -project itlwm.xcodeproj \
             -list \
-            -json > /tmp/xcode-list.json
+            | tee project-list.txt
 
-          python3 <<'PY'
-          import json
-          import os
+          echo ""
+          echo "===== SEQUOIA PROJECT REFERENCES ====="
 
-          with open("/tmp/xcode-list.json") as f:
-              data = json.load(f)
+          grep -Rni \
+            "Sequoia\|Tahoe\|AirportItlwm_Sequoia" \
+            AirportItlwm \
+            itlwm.xcodeproj \
+            2>/dev/null \
+            | tee sequoia-project-references.txt \
+            || true
 
-          project = data.get("project", {})
-          targets = project.get("targets", [])
-          schemes = project.get("schemes", [])
+      - name: Show AirportItlwm build settings
+        run: |
+          xcodebuild \
+            -project itlwm.xcodeproj \
+            -scheme "AirportItlwm" \
+            -configuration Debug \
+            -showBuildSettings \
+            | tee airport-build-settings.txt
 
-          print("Targets:")
-          for x in targets:
-              print("  ", x)
-
-          print("Schemes:")
-          for x in schemes:
-              print("  ", x)
-
-          sequoia_targets = [
-              x for x in targets
-              if "sequoia" in x.lower()
-          ]
-
-          sequoia_schemes = [
-              x for x in schemes
-              if "sequoia" in x.lower()
-          ]
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-              if sequoia_schemes:
-                  out.write(f"mode=scheme\n")
-                  out.write(f"name={sequoia_schemes[0]}\n")
-              elif sequoia_targets:
-                  out.write(f"mode=target\n")
-                  out.write(f"name={sequoia_targets[0]}\n")
-              elif "AirportItlwm (all)" in schemes:
-                  out.write("mode=scheme\n")
-                  out.write("name=AirportItlwm (all)\n")
-              elif "AirportItlwm" in schemes:
-                  out.write("mode=scheme\n")
-                  out.write("name=AirportItlwm\n")
-              else:
-                  raise SystemExit(
-                      "No suitable AirportItlwm build target/scheme found"
-                  )
-          PY
-
-      - name: Build native AirportItlwm
+      - name: Build AirportItlwm only
         run: |
           set -o pipefail
 
-          MODE="${{ steps.detect.outputs.mode }}"
-          NAME="${{ steps.detect.outputs.name }}"
-
-          echo "Building using $MODE: $NAME"
-
-          if [ "$MODE" = "target" ]; then
-            xcodebuild \
-              -project itlwm.xcodeproj \
-              -target "$NAME" \
-              -configuration Debug \
-              -derivedDataPath build \
-              ARCHS=x86_64 \
-              ONLY_ACTIVE_ARCH=YES \
-              MACOSX_DEPLOYMENT_TARGET=15.0 \
-              2>&1 | tee xcodebuild.log
-          else
-            xcodebuild \
-              -project itlwm.xcodeproj \
-              -scheme "$NAME" \
-              -configuration Debug \
-              -derivedDataPath build \
-              ARCHS=x86_64 \
-              ONLY_ACTIVE_ARCH=YES \
-              MACOSX_DEPLOYMENT_TARGET=15.0 \
-              2>&1 | tee xcodebuild.log
-          fi
+          xcodebuild \
+            -project itlwm.xcodeproj \
+            -scheme "AirportItlwm" \
+            -configuration Debug \
+            -derivedDataPath build \
+            ARCHS=x86_64 \
+            ONLY_ACTIVE_ARCH=YES \
+            MACOSX_DEPLOYMENT_TARGET=15.0 \
+            2>&1 | tee xcodebuild.log
 
       - name: Extract diagnostics
         if: always()
         run: |
           grep -n -E \
-            "error:|warning:|undefined symbol|unimplemented pure virtual method|BUILD FAILED" \
+            "error:|warning:|undefined symbol|BUILD FAILED|AirportItlwm_Sequoia|target '" \
             xcodebuild.log \
             > compiler-errors.txt || true
 
           echo "===== IMPORTANT DIAGNOSTICS ====="
-          tail -300 compiler-errors.txt || true
+          cat compiler-errors.txt || true
 
-      - name: Find AirportItlwm kexts
+      - name: Find generated kexts
         if: always()
         run: |
-          echo "===== GENERATED KEXTS ====="
-          find build -type d -name "AirportItlwm*.kext" -print || true
+          find build \
+            -type d \
+            -name "*.kext" \
+            -print \
+            | tee generated-kexts.txt \
+            || true
 
-      - name: Validate native binaries
+      - name: Validate binaries
         if: success()
         run: |
           mkdir -p analysis
@@ -170,19 +116,21 @@ jobs:
           find build \
             -path "*/AirportItlwm*.kext/Contents/MacOS/*" \
             -type f \
-            -print > analysis/binaries.txt
+            -print \
+            > analysis/binaries.txt
 
           while IFS= read -r BIN; do
-            echo "===================================="
+
+            echo "======================================"
             echo "$BIN"
-            echo "===================================="
+            echo "======================================"
 
             file "$BIN"
 
-            echo "--- Undefined postMessage symbols ---"
+            echo "--- postMessage ---"
             nm -u "$BIN" | grep -i postMessage || true
 
-            echo "--- IO80211 symbols ---"
+            echo "--- IO80211 ---"
             nm -u "$BIN" | grep -i IO80211 | head -100 || true
 
           done < analysis/binaries.txt \
@@ -193,14 +141,17 @@ jobs:
         run: |
           mkdir -p artifacts
 
-          while IFS= read -r KEXT; do
-            cp -R "$KEXT" artifacts/
-          done < <(
-            find build -type d -name "AirportItlwm*.kext"
-          )
+          find build \
+            -type d \
+            -name "AirportItlwm*.kext" \
+            -exec cp -R {} artifacts/ \;
 
           cp xcodebuild.log artifacts/
           cp compiler-errors.txt artifacts/
+          cp project-list.txt artifacts/
+          cp airport-build-settings.txt artifacts/
+          cp sequoia-project-references.txt artifacts/
+          cp generated-kexts.txt artifacts/
           cp -R analysis artifacts/
 
           ditto \
@@ -211,14 +162,14 @@ jobs:
             artifacts \
             AirportItlwm-Sequoia-native.zip
 
-      - name: Upload native build
+      - name: Upload successful build
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: AirportItlwm-Sequoia-native
           path: AirportItlwm-Sequoia-native.zip
 
-      - name: Upload failed build logs
+      - name: Upload failed build diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -226,3 +177,7 @@ jobs:
           path: |
             xcodebuild.log
             compiler-errors.txt
+            project-list.txt
+            airport-build-settings.txt
+            sequoia-project-references.txt
+            generated-kexts.txt
