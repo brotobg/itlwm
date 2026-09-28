@@ -1,4 +1,4 @@
-name: Final Link Validate AirportItlwm Sequoia
+name: Exhaustive AirportItlwm Sequoia Validation
 
 on:
   workflow_dispatch:
@@ -13,9 +13,11 @@ jobs:
 
       - name: Clone MacKernelSDK
         run: |
-          git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
+          rm -rf MacKernelSDK
+          git clone --depth=1 \
+            https://github.com/acidanthera/MacKernelSDK.git
 
-      - name: Patch postMessage for Sequoia
+      - name: Apply Sequoia postMessage ABI patch
         run: |
           python3 <<'PY'
           from pathlib import Path
@@ -23,25 +25,48 @@ jobs:
           p = Path("include/Airport/IO80211ControllerV2.h")
           s = p.read_text()
 
-          old1 = "virtual void postMessage(UInt,void *,unsigned long,UInt,void *);"
-          old2 = "virtual void postMessage(UInt, void *, unsigned long, UInt, void *);"
+          old_variants = [
+              "virtual void postMessage(UInt,void *,unsigned long,UInt,void *);",
+              "virtual void postMessage(UInt, void *, unsigned long, UInt, void *);",
+          ]
 
           new = (
               "virtual void postMessage("
               "IO80211SkywalkInterface *, UInt, void *, unsigned long, bool);"
           )
 
-          if old1 in s:
-              s = s.replace(old1, new)
-          elif old2 in s:
-              s = s.replace(old2, new)
+          for old in old_variants:
+              if old in s:
+                  s = s.replace(old, new)
+                  break
           else:
               raise SystemExit("Old postMessage signature not found")
 
           p.write_text(s)
+
+          print("Sequoia ABI patch applied:")
+          print(new)
           PY
 
-      - name: Build
+      - name: Show runner environment
+        run: |
+          echo "===== macOS ====="
+          sw_vers
+
+          echo
+          echo "===== Architecture ====="
+          uname -m
+
+          echo
+          echo "===== Xcode ====="
+          xcodebuild -version
+
+          echo
+          echo "===== SDK ====="
+          xcrun --show-sdk-version
+          xcrun --show-sdk-path
+
+      - name: Build AirportItlwm
         run: |
           set -o pipefail
 
@@ -57,46 +82,217 @@ jobs:
 
       - name: Locate kext
         run: |
-          KEXT=$(find build -type d -name "AirportItlwm.kext" | head -1)
+          KEXT=$(find build \
+            -type d \
+            -name "AirportItlwm.kext" \
+            | head -1)
+
+          if [ -z "$KEXT" ]; then
+            echo "ERROR: AirportItlwm.kext not found"
+            exit 1
+          fi
+
           BIN="$KEXT/Contents/MacOS/AirportItlwm"
+
+          if [ ! -f "$BIN" ]; then
+            echo "ERROR: AirportItlwm executable not found"
+            exit 1
+          fi
 
           echo "KEXT=$KEXT" >> "$GITHUB_ENV"
           echo "BIN=$BIN" >> "$GITHUB_ENV"
 
-          test -d "$KEXT"
-          test -f "$BIN"
+          echo "KEXT = $KEXT"
+          echo "BIN  = $BIN"
+
+      - name: Create diagnostics directory
+        run: |
+          mkdir -p diagnostics
+
+      - name: Validate plist
+        run: |
+          {
+            echo "===== PLUTIL VALIDATION ====="
+            plutil -lint "$KEXT/Contents/Info.plist"
+
+            echo
+            echo "===== COMPLETE INFO.PLIST ====="
+            plutil -p "$KEXT/Contents/Info.plist"
+
+            echo
+            echo "===== BUNDLE ID ====="
+            /usr/libexec/PlistBuddy \
+              -c "Print :CFBundleIdentifier" \
+              "$KEXT/Contents/Info.plist"
+
+            echo
+            echo "===== BUNDLE EXECUTABLE ====="
+            /usr/libexec/PlistBuddy \
+              -c "Print :CFBundleExecutable" \
+              "$KEXT/Contents/Info.plist"
+
+            echo
+            echo "===== OS BUNDLE LIBRARIES ====="
+            /usr/libexec/PlistBuddy \
+              -c "Print :OSBundleLibraries" \
+              "$KEXT/Contents/Info.plist" || true
+
+            echo
+            echo "===== IOKIT PERSONALITIES ====="
+            /usr/libexec/PlistBuddy \
+              -c "Print :IOKitPersonalities" \
+              "$KEXT/Contents/Info.plist" || true
+
+          } | tee diagnostics/plist-validation.txt
+
+      - name: Inspect Mach-O binary
+        run: |
+          {
+            echo "===== FILE ====="
+            file "$BIN"
+
+            echo
+            echo "===== LIPO ====="
+            lipo -info "$BIN"
+
+            echo
+            echo "===== MACH-O LOAD COMMANDS ====="
+            otool -l "$BIN"
+
+            echo
+            echo "===== MACH-O HEADER ====="
+            otool -hv "$BIN"
+
+          } | tee diagnostics/macho.txt
+
+      - name: Verify deployment target
+        run: |
+          {
+            echo "===== BUILD VERSION ====="
+
+            otool -l "$BIN" | awk '
+              /LC_BUILD_VERSION/ {show=1}
+              show {print}
+              show && /sdk/ {show=0}
+            '
+
+            echo
+            echo "===== MIN VERSION ====="
+
+            otool -l "$BIN" | awk '
+              /LC_VERSION_MIN_MACOSX/ {show=1}
+              show {print}
+              show && /sdk/ {show=0}
+            '
+
+          } | tee diagnostics/deployment-target.txt
+
+      - name: Dump undefined symbols
+        run: |
+          nm -u "$BIN" \
+            | sort \
+            | tee diagnostics/undefined-symbols.txt
+
+      - name: Analyze IO80211 symbols
+        run: |
+          {
+            echo "===== ALL IO80211 UNDEFINED SYMBOLS ====="
+
+            nm -u "$BIN" \
+              | grep -i "IO80211" \
+              | sort \
+              || true
+
+            echo
+            echo "===== postMessage SYMBOLS ====="
+
+            nm -u "$BIN" \
+              | grep -i "postMessage" \
+              | sort \
+              || true
+
+          } | tee diagnostics/io80211-symbols.txt
+
+      - name: Check for obsolete Sonoma postMessage ABI
+        run: |
+          python3 <<'PY' | tee diagnostics/postmessage-abi-check.txt
+          import subprocess
+
+          binary = subprocess.check_output(
+              ["bash", "-lc", 'printf "%s" "$BIN"'],
+              text=True
+          ).strip()
+
+          out = subprocess.check_output(
+              ["nm", "-u", binary],
+              text=True
+          )
+
+          old = "__ZN17IO80211Controller11postMessageEjPvmjS0_"
+          new = "__ZN17IO80211Controller11postMessageEP23IO80211SkywalkInterfacejPvmb"
+
+          print("Old Sonoma ABI present:", old in out)
+          print("New Sequoia ABI present:", new in out)
+
+          if old in out:
+              raise SystemExit(
+                  "FAIL: obsolete Sonoma postMessage ABI still present"
+              )
+
+          if new not in out:
+              raise SystemExit(
+                  "FAIL: Sequoia postMessage ABI not found"
+              )
+
+          print("PASS: postMessage ABI is Sequoia-compatible")
+          PY
 
       - name: Prepare permissions
         run: |
           sudo chown -R root:wheel "$KEXT"
-          sudo find "$KEXT" -type d -exec chmod 755 {} \;
-          sudo find "$KEXT" -type f -exec chmod 644 {} \;
+
+          sudo find "$KEXT" \
+            -type d \
+            -exec chmod 755 {} \;
+
+          sudo find "$KEXT" \
+            -type f \
+            -exec chmod 644 {} \;
+
           sudo chmod 755 "$BIN"
 
-      - name: Show unresolved kernel symbols
+      - name: Dependency resolution
         continue-on-error: true
         run: |
-          mkdir -p diagnostics
+          {
+            echo "===== REQUIRED LIBRARIES ====="
 
-          echo "===== UNRESOLVED SYMBOLS =====" \
-            | tee diagnostics/unresolved.txt
+            sudo kmutil libraries \
+              -z \
+              -p "$KEXT" \
+              --xml
 
-          sudo kmutil libraries \
-            -z \
-            -p "$KEXT" \
-            --undef-symbols \
-            2>&1 | tee -a diagnostics/unresolved.txt
+            echo
+            echo "===== UNRESOLVED SYMBOLS ONLY ====="
 
-      - name: Show all symbol resolutions
+            sudo kmutil libraries \
+              -z \
+              -p "$KEXT" \
+              --undef-symbols
+
+          } 2>&1 | tee diagnostics/kmutil-libraries.txt
+
+      - name: All symbol providers
         continue-on-error: true
         run: |
           sudo kmutil libraries \
             -z \
             -p "$KEXT" \
             --all-symbols \
-            2>&1 | tee diagnostics/all-symbols.txt
+            2>&1 \
+            | tee diagnostics/all-symbol-providers.txt
 
-      - name: Deep diagnostics without authentication
+      - name: kmutil deep dependency diagnostics
         continue-on-error: true
         run: |
           sudo kmutil print-diagnostics \
@@ -104,34 +300,96 @@ jobs:
             -p "$KEXT" \
             -D \
             -a x86_64 \
-            2>&1 | tee diagnostics/deep-link-test.txt
+            2>&1 \
+            | tee diagnostics/kmutil-deep.txt
 
-      - name: Extract important results
+      - name: kextutil no-load link test
+        continue-on-error: true
+        run: |
+          echo "===== KEXTUTIL NO-LOAD TEST =====" \
+            | tee diagnostics/kextutil-no-load.txt
+
+          sudo kextutil \
+            -n \
+            -z \
+            -v 6 \
+            "$KEXT" \
+            2>&1 \
+            | tee -a diagnostics/kextutil-no-load.txt
+
+      - name: Inspect BootKernelExtensions collection
+        continue-on-error: true
+        run: |
+          BKC="/System/Library/KernelCollections/BootKernelExtensions.kc"
+
+          {
+            echo "===== BOOT KC ====="
+            ls -lh "$BKC"
+
+            echo
+            echo "===== IO80211 FAMILY ENTRY ====="
+
+            kmutil inspect \
+              --show-fileset-entries \
+              -B "$BKC" \
+              | grep -i -E \
+                "IO80211|IOSkywalk|IONetworking" \
+              || true
+
+          } 2>&1 | tee diagnostics/kernel-collection.txt
+
+      - name: Codesign information
+        continue-on-error: true
+        run: |
+          {
+            echo "===== CODESIGN ====="
+
+            codesign \
+              -dvvv \
+              "$KEXT"
+
+            echo
+            echo "===== EXECUTABLE CODESIGN ====="
+
+            codesign \
+              -dvvv \
+              "$BIN"
+
+          } 2>&1 | tee diagnostics/codesign.txt
+
+      - name: Final failure scan
         if: always()
         run: |
           {
-            echo "===== FAILURES ====="
+            echo "===== CRITICAL LINK / ABI ERRORS ====="
 
             grep -RniE \
-              "not found|Failed to bind|undefined|multiply-defined|dependency.*fail|cannot link|linking failed|error:" \
+              "Failed to bind|could not find a kext which exports|undefined symbol|unresolved symbol|cannot link|linking failed|dependency.*fail|multiply-defined|incompatible architecture|malformed|invalid executable" \
               diagnostics \
               || true
 
             echo
-            echo "===== postMessage ====="
+            echo "===== SECURITY-ONLY ERRORS ====="
 
-            nm -u "$BIN" | grep -i postMessage || true
+            grep -RniE \
+              "not approved|approval|required|Bad code signature|authentication" \
+              diagnostics \
+              || true
 
-          } | tee diagnostics/summary.txt
+          } | tee diagnostics/final-summary.txt
 
-      - name: Package
+      - name: Save build log
+        if: always()
+        run: |
+          cp xcodebuild.log diagnostics/
+
+      - name: Package exhaustive validation
         if: always()
         run: |
           mkdir -p artifact
 
           cp -R "$KEXT" artifact/
           cp -R diagnostics artifact/
-          cp xcodebuild.log artifact/
 
           ditto \
             -c \
@@ -139,11 +397,11 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             artifact \
-            AirportItlwm-Sequoia-final-validation.zip
+            AirportItlwm-Sequoia-exhaustive-validation.zip
 
-      - name: Upload
+      - name: Upload validation
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: AirportItlwm-Sequoia-final-validation
-          path: AirportItlwm-Sequoia-final-validation.zip
+          name: AirportItlwm-Sequoia-exhaustive-validation
+          path: AirportItlwm-Sequoia-exhaustive-validation.zip
