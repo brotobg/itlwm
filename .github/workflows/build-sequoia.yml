@@ -1,55 +1,151 @@
-name: Export Sequoia Port Sources
+name: Build AirportItlwm Sequoia ABI Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  export:
+  build:
     runs-on: macos-15-intel
 
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
 
-      - name: Fetch PR 1055
+      - name: Clone MacKernelSDK
         run: |
-          git remote remove upstream 2>/dev/null || true
-          git remote add upstream https://github.com/OpenIntelWireless/itlwm.git
-          git fetch --no-tags upstream \
-            +refs/pull/1055/head:refs/remotes/upstream/pr1055
-          git checkout --detach refs/remotes/upstream/pr1055
+          rm -rf MacKernelSDK
+          git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
 
-      - name: Collect Sequoia port sources
+      - name: Patch IO80211Controller postMessage ABI for Sequoia
         run: |
-          mkdir -p export/AirportItlwm
-          mkdir -p export/include/Airport
-          mkdir -p export/Project
+          python3 <<'PY'
+          from pathlib import Path
 
-          cp itlwm.xcodeproj/project.pbxproj \
-             export/Project/
+          p = Path("include/Airport/IO80211ControllerV2.h")
+          s = p.read_text()
 
-          cp -R itlwm.xcodeproj/xcshareddata \
-             export/Project/ 2>/dev/null || true
+          old = "virtual void postMessage(UInt,void *,unsigned long,UInt,void *);"
+          new = "virtual void postMessage(IO80211SkywalkInterface *,UInt,void *,unsigned long,bool);"
 
-          cp AirportItlwm/*.cpp \
-             export/AirportItlwm/ || true
+          if old not in s:
+              raise SystemExit("Old postMessage signature not found")
 
-          cp AirportItlwm/*.hpp \
-             export/AirportItlwm/ || true
+          s = s.replace(old, new)
 
-          cp AirportItlwm/*.plist \
-             export/AirportItlwm/ || true
+          p.write_text(s)
 
-          cp include/Airport/IO80211*.h \
-             export/include/Airport/ || true
+          print("Patched:")
+          print(new)
+          PY
 
-          cp include/Airport/Apple80211* \
-             export/include/Airport/ 2>/dev/null || true
+      - name: Show environment
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --show-sdk-version
+          uname -m
 
-          find export -type f | sort > export/file-list.txt
+      - name: Build Sonoma14.4 target against Sequoia
+        run: |
+          set -o pipefail
 
-      - name: Upload sources
+          xcodebuild \
+            -project itlwm.xcodeproj \
+            -target "AirportItlwm-Sonoma14.4" \
+            -configuration Debug \
+            SYMROOT="$PWD/build" \
+            ARCHS=x86_64 \
+            ONLY_ACTIVE_ARCH=YES \
+            MACOSX_DEPLOYMENT_TARGET=15.0 \
+            2>&1 | tee xcodebuild.log
+
+      - name: Extract diagnostics
+        if: always()
+        run: |
+          grep -n -E \
+            "error:|warning:|undefined symbol|BUILD FAILED|postMessage" \
+            xcodebuild.log \
+            > compiler-errors.txt || true
+
+          cat compiler-errors.txt || true
+
+      - name: Find generated kext
+        if: always()
+        run: |
+          find build \
+            -type d \
+            -name "AirportItlwm.kext" \
+            -print \
+            | tee generated-kexts.txt || true
+
+      - name: Validate postMessage ABI
+        if: success()
+        run: |
+          mkdir -p analysis
+
+          BIN=$(find build \
+            -path "*/AirportItlwm.kext/Contents/MacOS/AirportItlwm" \
+            -type f \
+            | head -1)
+
+          echo "Binary: $BIN"
+
+          file "$BIN" | tee analysis/file.txt
+
+          echo "===== Undefined postMessage symbols =====" \
+            | tee analysis/postmessage.txt
+
+          nm -u "$BIN" \
+            | grep -i postMessage \
+            | tee -a analysis/postmessage.txt \
+            || true
+
+          echo "===== All IO80211Controller symbols =====" \
+            | tee analysis/io80211controller.txt
+
+          nm -u "$BIN" \
+            | grep -i IO80211Controller \
+            | tee -a analysis/io80211controller.txt \
+            || true
+
+      - name: Package successful build
+        if: success()
+        run: |
+          mkdir -p artifacts
+
+          KEXT=$(find build \
+            -type d \
+            -name "AirportItlwm.kext" \
+            | head -1)
+
+          cp -R "$KEXT" artifacts/
+
+          cp xcodebuild.log artifacts/
+          cp compiler-errors.txt artifacts/
+          cp generated-kexts.txt artifacts/
+          cp -R analysis artifacts/
+
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            artifacts \
+            AirportItlwm-Sequoia-ABI-test.zip
+
+      - name: Upload successful build
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: AirportItlwm-Sequoia-source-snapshot
-          path: export
+          name: AirportItlwm-Sequoia-ABI-test
+          path: AirportItlwm-Sequoia-ABI-test.zip
+
+      - name: Upload failed diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirportItlwm-Sequoia-build-logs
+          path: |
+            xcodebuild.log
+            compiler-errors.txt
+            generated-kexts.txt
