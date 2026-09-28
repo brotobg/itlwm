@@ -8,121 +8,203 @@ jobs:
     runs-on: macos-15-intel
 
     steps:
-      - name: Checkout fork
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Apply Sequoia PR 1054
+      - name: Fetch native Sequoia PR 1055
         run: |
-          curl -L https://github.com/OpenIntelWireless/itlwm/pull/1054.patch -o /tmp/sequoia.patch
-          git apply --check /tmp/sequoia.patch
-          git apply /tmp/sequoia.patch
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/OpenIntelWireless/itlwm.git
 
-      - name: Complete Sequoia Skywalk virtual interface
-        run: |
-          python3 <<'PY'
-          from pathlib import Path
+          git fetch --no-tags upstream \
+            +refs/pull/1055/head:refs/remotes/upstream/pr1055
 
-          p = Path("AirportItlwm/AirportItlwmSkywalkInterface.hpp")
-          s = p.read_text()
+          git checkout --detach refs/remotes/upstream/pr1055
 
-          marker = "virtual IOReturn getAUTH_TYPE(apple80211_authtype_data *) override;"
+          echo "===== CURRENT COMMIT ====="
+          git log -1 --oneline
 
-          methods = r'''
-              virtual IOReturn getCHANNEL(apple80211_channel_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getPOWERSAVE(apple80211_powersave_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getTXPOWER(apple80211_txpower_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getRATE(apple80211_rate_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getBSSID(apple80211_bssid_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getSCAN_RESULT(apple80211_scan_result *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getSTATE(apple80211_state_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getPHY_MODE(apple80211_phymode_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getOP_MODE(apple80211_opmode_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getRSSI(apple80211_rssi_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getNOISE(apple80211_noise_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getSUPPORTED_CHANNELS(apple80211_sup_channel_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getLOCALE(apple80211_locale_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getDEAUTH(apple80211_deauth_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getRATE_SET(apple80211_rate_set_data *) override { return kIOReturnUnsupported; }
-              virtual IOReturn getDTIM_INT(apple80211_dtim_int_data *) override { return kIOReturnUnsupported; }
-          '''
-
-          if marker not in s:
-              raise SystemExit("marker not found")
-
-          if "getCHANNEL(apple80211_channel_data *) override" not in s:
-              s = s.replace(marker, marker + "\n" + methods)
-
-          p.write_text(s)
-
-          print("Patched:", p)
-          PY
+          echo "===== CURRENT BRANCH STATE ====="
+          git status --short
 
       - name: Clone MacKernelSDK
         run: |
+          rm -rf MacKernelSDK
           git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
 
-      - name: Show Xcode environment
+      - name: Show build environment
         run: |
+          echo "===== macOS ====="
           sw_vers
-          xcodebuild -version
-          xcrun --show-sdk-version
 
-      - name: List schemes
+          echo "===== XCODE ====="
+          xcodebuild -version
+
+          echo "===== SDK ====="
+          xcrun --show-sdk-version
+          xcrun --show-sdk-path
+
+          echo "===== ARCH ====="
+          uname -m
+
+      - name: Inspect Sequoia project
         run: |
+          echo "===== XCODE PROJECT ====="
           xcodebuild -project itlwm.xcodeproj -list
 
-      - name: Build AirportItlwm
+          echo "===== SEQUOIA REFERENCES ====="
+          grep -Rni "Sequoia" \
+            AirportItlwm \
+            itlwm.xcodeproj/project.pbxproj \
+            2>/dev/null | head -150 || true
+
+      - name: Detect Sequoia target
+        id: detect
+        run: |
+          xcodebuild \
+            -project itlwm.xcodeproj \
+            -list \
+            -json > /tmp/xcode-list.json
+
+          python3 <<'PY'
+          import json
+          import os
+
+          with open("/tmp/xcode-list.json") as f:
+              data = json.load(f)
+
+          project = data.get("project", {})
+          targets = project.get("targets", [])
+          schemes = project.get("schemes", [])
+
+          print("Targets:")
+          for x in targets:
+              print("  ", x)
+
+          print("Schemes:")
+          for x in schemes:
+              print("  ", x)
+
+          sequoia_targets = [
+              x for x in targets
+              if "sequoia" in x.lower()
+          ]
+
+          sequoia_schemes = [
+              x for x in schemes
+              if "sequoia" in x.lower()
+          ]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              if sequoia_schemes:
+                  out.write(f"mode=scheme\n")
+                  out.write(f"name={sequoia_schemes[0]}\n")
+              elif sequoia_targets:
+                  out.write(f"mode=target\n")
+                  out.write(f"name={sequoia_targets[0]}\n")
+              elif "AirportItlwm (all)" in schemes:
+                  out.write("mode=scheme\n")
+                  out.write("name=AirportItlwm (all)\n")
+              elif "AirportItlwm" in schemes:
+                  out.write("mode=scheme\n")
+                  out.write("name=AirportItlwm\n")
+              else:
+                  raise SystemExit(
+                      "No suitable AirportItlwm build target/scheme found"
+                  )
+          PY
+
+          echo "Selected mode: ${{ steps.detect.outputs.mode }}"
+          echo "Selected name: ${{ steps.detect.outputs.name }}"
+
+      - name: Build native AirportItlwm
         run: |
           set -o pipefail
 
-          xcodebuild \
-            -project itlwm.xcodeproj \
-            -scheme "AirportItlwm (all)" \
-            -configuration Debug \
-            -derivedDataPath build \
-            ARCHS=x86_64 \
-            ONLY_ACTIVE_ARCH=YES \
-            2>&1 | tee xcodebuild.log
+          MODE="${{ steps.detect.outputs.mode }}"
+          NAME="${{ steps.detect.outputs.name }}"
 
-      - name: Extract compiler errors
+          echo "Building using $MODE: $NAME"
+
+          if [ "$MODE" = "target" ]; then
+            xcodebuild \
+              -project itlwm.xcodeproj \
+              -target "$NAME" \
+              -configuration Debug \
+              -derivedDataPath build \
+              ARCHS=x86_64 \
+              ONLY_ACTIVE_ARCH=YES \
+              MACOSX_DEPLOYMENT_TARGET=15.0 \
+              2>&1 | tee xcodebuild.log
+          else
+            xcodebuild \
+              -project itlwm.xcodeproj \
+              -scheme "$NAME" \
+              -configuration Debug \
+              -derivedDataPath build \
+              ARCHS=x86_64 \
+              ONLY_ACTIVE_ARCH=YES \
+              MACOSX_DEPLOYMENT_TARGET=15.0 \
+              2>&1 | tee xcodebuild.log
+          fi
+
+      - name: Extract diagnostics
         if: always()
         run: |
-          echo "===== COMPILER ERRORS ====="
-          grep -n -E "error:|unimplemented pure virtual method" xcodebuild.log \
+          grep -n -E \
+            "error:|warning:|undefined symbol|unimplemented pure virtual method|BUILD FAILED" \
+            xcodebuild.log \
             > compiler-errors.txt || true
 
-          cat compiler-errors.txt || true
+          echo "===== IMPORTANT DIAGNOSTICS ====="
+          tail -300 compiler-errors.txt || true
 
-      - name: Find built kexts
+      - name: Find AirportItlwm kexts
         if: always()
         run: |
-          find build -type d -name "*.kext" -print || true
+          echo "===== GENERATED KEXTS ====="
+          find build -type d -name "AirportItlwm*.kext" -print || true
 
-      - name: Check old postMessage symbol
+      - name: Validate native binaries
         if: success()
         run: |
+          mkdir -p analysis
+
           find build \
             -path "*/AirportItlwm*.kext/Contents/MacOS/*" \
             -type f \
-            -print \
-            -exec nm -u {} \; \
-            | tee postmessage-check.txt
+            -print > analysis/binaries.txt
 
-          grep -i postMessage postmessage-check.txt || true
+          while IFS= read -r BIN; do
+            echo "===================================="
+            echo "$BIN"
+            echo "===================================="
 
-      - name: Package result
+            file "$BIN"
+
+            echo "--- Undefined postMessage symbols ---"
+            nm -u "$BIN" | grep -i postMessage || true
+
+            echo "--- IO80211 symbols ---"
+            nm -u "$BIN" | grep -i IO80211 | head -100 || true
+
+          done < analysis/binaries.txt \
+            | tee analysis/binary-analysis.txt
+
+      - name: Package successful build
         if: success()
         run: |
           mkdir -p artifacts
 
-          find build \
-            -type d \
-            -name "AirportItlwm*.kext" \
-            -exec cp -R {} artifacts/ \;
+          while IFS= read -r KEXT; do
+            cp -R "$KEXT" artifacts/
+          done < <(
+            find build -type d -name "AirportItlwm*.kext"
+          )
 
-          cp postmessage-check.txt artifacts/ || true
-          cp compiler-errors.txt artifacts/ || true
-          cp xcodebuild.log artifacts/ || true
+          cp xcodebuild.log artifacts/
+          cp compiler-errors.txt artifacts/
+          cp -R analysis artifacts/
 
           ditto \
             -c \
@@ -132,7 +214,7 @@ jobs:
             artifacts \
             AirportItlwm-Sequoia-native.zip
 
-      - name: Upload successful artifact
+      - name: Upload native build
         if: success()
         uses: actions/upload-artifact@v4
         with:
