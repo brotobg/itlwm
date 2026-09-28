@@ -17,6 +17,46 @@ jobs:
           git apply --check /tmp/sequoia.patch
           git apply /tmp/sequoia.patch
 
+      - name: Complete Sequoia Skywalk virtual interface
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("AirportItlwm/AirportItlwmSkywalkInterface.hpp")
+          s = p.read_text()
+
+          marker = "virtual IOReturn getAUTH_TYPE(apple80211_authtype_data *) override;"
+
+          methods = r'''
+              virtual IOReturn getCHANNEL(apple80211_channel_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getPOWERSAVE(apple80211_powersave_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getTXPOWER(apple80211_txpower_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getRATE(apple80211_rate_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getBSSID(apple80211_bssid_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getSCAN_RESULT(apple80211_scan_result *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getSTATE(apple80211_state_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getPHY_MODE(apple80211_phymode_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getOP_MODE(apple80211_opmode_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getRSSI(apple80211_rssi_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getNOISE(apple80211_noise_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getSUPPORTED_CHANNELS(apple80211_sup_channel_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getLOCALE(apple80211_locale_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getDEAUTH(apple80211_deauth_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getRATE_SET(apple80211_rate_set_data *) override { return kIOReturnUnsupported; }
+              virtual IOReturn getDTIM_INT(apple80211_dtim_int_data *) override { return kIOReturnUnsupported; }
+          '''
+
+          if marker not in s:
+              raise SystemExit("marker not found")
+
+          if "getCHANNEL(apple80211_channel_data *) override" not in s:
+              s = s.replace(marker, marker + "\n" + methods)
+
+          p.write_text(s)
+
+          print("Patched:", p)
+          PY
+
       - name: Clone MacKernelSDK
         run: |
           git clone --depth=1 https://github.com/acidanthera/MacKernelSDK.git
@@ -33,33 +73,77 @@ jobs:
 
       - name: Build AirportItlwm
         run: |
+          set -o pipefail
+
           xcodebuild \
             -project itlwm.xcodeproj \
             -scheme "AirportItlwm (all)" \
             -configuration Debug \
             -derivedDataPath build \
             ARCHS=x86_64 \
-            ONLY_ACTIVE_ARCH=YES
+            ONLY_ACTIVE_ARCH=YES \
+            2>&1 | tee xcodebuild.log
+
+      - name: Extract compiler errors
+        if: always()
+        run: |
+          echo "===== COMPILER ERRORS ====="
+          grep -n -E "error:|unimplemented pure virtual method" xcodebuild.log \
+            > compiler-errors.txt || true
+
+          cat compiler-errors.txt || true
 
       - name: Find built kexts
+        if: always()
         run: |
-          find build -type d -name "*.kext" -print
+          find build -type d -name "*.kext" -print || true
 
       - name: Check old postMessage symbol
+        if: success()
         run: |
-          find build -path "*/AirportItlwm*.kext/Contents/MacOS/*" -type f -print -exec nm -u {} \; \
+          find build \
+            -path "*/AirportItlwm*.kext/Contents/MacOS/*" \
+            -type f \
+            -print \
+            -exec nm -u {} \; \
             | tee postmessage-check.txt
+
           grep -i postMessage postmessage-check.txt || true
 
       - name: Package result
+        if: success()
         run: |
           mkdir -p artifacts
-          find build -type d -name "AirportItlwm*.kext" -exec cp -R {} artifacts/ \;
-          cp postmessage-check.txt artifacts/
-          ditto -c -k --sequesterRsrc --keepParent artifacts AirportItlwm-Sequoia-native.zip
 
-      - name: Upload artifact
+          find build \
+            -type d \
+            -name "AirportItlwm*.kext" \
+            -exec cp -R {} artifacts/ \;
+
+          cp postmessage-check.txt artifacts/ || true
+          cp compiler-errors.txt artifacts/ || true
+          cp xcodebuild.log artifacts/ || true
+
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            artifacts \
+            AirportItlwm-Sequoia-native.zip
+
+      - name: Upload successful artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: AirportItlwm-Sequoia-native
           path: AirportItlwm-Sequoia-native.zip
+
+      - name: Upload failed build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirportItlwm-Sequoia-build-logs
+          path: |
+            xcodebuild.log
+            compiler-errors.txt
