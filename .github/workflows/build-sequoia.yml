@@ -1,10 +1,10 @@
-name: Build AirportItlwm Sequoia ABI Test
+name: Validate AirportItlwm on Sequoia
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  validate:
     runs-on: macos-15-intel
 
     steps:
@@ -24,28 +24,45 @@ jobs:
           p = Path("include/Airport/IO80211ControllerV2.h")
           s = p.read_text()
 
-          old = "virtual void postMessage(UInt,void *,unsigned long,UInt,void *);"
-          new = "virtual void postMessage(IO80211SkywalkInterface *,UInt,void *,unsigned long,bool);"
+          old_variants = [
+              "virtual void postMessage(UInt,void *,unsigned long,UInt,void *);",
+              "virtual void postMessage(UInt, void *, unsigned long, UInt, void *);",
+          ]
 
-          if old not in s:
+          new = "virtual void postMessage(IO80211SkywalkInterface *, UInt, void *, unsigned long, bool);"
+
+          found = False
+          for old in old_variants:
+              if old in s:
+                  s = s.replace(old, new)
+                  found = True
+                  break
+
+          if not found:
               raise SystemExit("Old postMessage signature not found")
-
-          s = s.replace(old, new)
 
           p.write_text(s)
 
-          print("Patched:")
+          print("Patched IO80211ControllerV2.h")
           print(new)
           PY
 
       - name: Show environment
         run: |
+          echo "===== macOS ====="
           sw_vers
+
+          echo "===== Xcode ====="
           xcodebuild -version
+
+          echo "===== SDK ====="
           xcrun --show-sdk-version
+          xcrun --show-sdk-path
+
+          echo "===== Architecture ====="
           uname -m
 
-      - name: Build Sonoma14.4 target against Sequoia
+      - name: Build AirportItlwm Sonoma14.4 ABI test
         run: |
           set -o pipefail
 
@@ -59,93 +76,194 @@ jobs:
             MACOSX_DEPLOYMENT_TARGET=15.0 \
             2>&1 | tee xcodebuild.log
 
-      - name: Extract diagnostics
-        if: always()
+      - name: Locate built kext
+        id: locate
         run: |
-          grep -n -E \
-            "error:|warning:|undefined symbol|BUILD FAILED|postMessage" \
-            xcodebuild.log \
-            > compiler-errors.txt || true
+          KEXT=$(find build -type d -name "AirportItlwm.kext" | head -1)
 
-          cat compiler-errors.txt || true
+          if [ -z "$KEXT" ]; then
+            echo "AirportItlwm.kext not found"
+            exit 1
+          fi
 
-      - name: Find generated kext
-        if: always()
+          echo "KEXT=$KEXT" >> "$GITHUB_ENV"
+
+          BIN="$KEXT/Contents/MacOS/AirportItlwm"
+
+          if [ ! -f "$BIN" ]; then
+            echo "AirportItlwm binary not found"
+            exit 1
+          fi
+
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+          echo "Found kext:"
+          echo "$KEXT"
+
+          echo "Found binary:"
+          echo "$BIN"
+
+      - name: Inspect binary
         run: |
-          find build \
-            -type d \
-            -name "AirportItlwm.kext" \
-            -print \
-            | tee generated-kexts.txt || true
+          mkdir -p diagnostics
 
-      - name: Validate postMessage ABI
-        if: success()
+          echo "===== FILE =====" \
+            | tee diagnostics/file.txt
+
+          file "$BIN" \
+            | tee -a diagnostics/file.txt
+
+          echo "===== ARCHITECTURES =====" \
+            | tee diagnostics/architectures.txt
+
+          lipo -info "$BIN" \
+            | tee -a diagnostics/architectures.txt
+
+          echo "===== INFO.PLIST =====" \
+            | tee diagnostics/plist.txt
+
+          plutil -p "$KEXT/Contents/Info.plist" \
+            | tee -a diagnostics/plist.txt
+
+      - name: Inspect undefined symbols
         run: |
-          mkdir -p analysis
+          echo "===== ALL UNDEFINED SYMBOLS =====" \
+            | tee diagnostics/undefined-symbols.txt
 
-          BIN=$(find build \
-            -path "*/AirportItlwm.kext/Contents/MacOS/AirportItlwm" \
-            -type f \
-            | head -1)
+          nm -u "$BIN" \
+            | tee -a diagnostics/undefined-symbols.txt
 
-          echo "Binary: $BIN"
-
-          file "$BIN" | tee analysis/file.txt
-
-          echo "===== Undefined postMessage symbols =====" \
-            | tee analysis/postmessage.txt
+          echo "===== postMessage SYMBOLS =====" \
+            | tee diagnostics/postmessage-symbols.txt
 
           nm -u "$BIN" \
             | grep -i postMessage \
-            | tee -a analysis/postmessage.txt \
+            | tee -a diagnostics/postmessage-symbols.txt \
             || true
 
-          echo "===== All IO80211Controller symbols =====" \
-            | tee analysis/io80211controller.txt
+          echo "===== IO80211Controller SYMBOLS =====" \
+            | tee diagnostics/io80211controller-symbols.txt
 
           nm -u "$BIN" \
             | grep -i IO80211Controller \
-            | tee -a analysis/io80211controller.txt \
+            | tee -a diagnostics/io80211controller-symbols.txt \
             || true
 
-      - name: Package successful build
-        if: success()
+          echo "===== IO80211SkywalkInterface SYMBOLS =====" \
+            | tee diagnostics/skywalk-symbols.txt
+
+          nm -u "$BIN" \
+            | grep -i IO80211SkywalkInterface \
+            | tee -a diagnostics/skywalk-symbols.txt \
+            || true
+
+          echo "===== IO80211InfraInterface SYMBOLS =====" \
+            | tee diagnostics/infra-symbols.txt
+
+          nm -u "$BIN" \
+            | grep -i IO80211InfraInterface \
+            | tee -a diagnostics/infra-symbols.txt \
+            || true
+
+      - name: Validate bundle structure
         run: |
-          mkdir -p artifacts
+          echo "===== CODESIGN =====" \
+            | tee diagnostics/codesign.txt
 
-          KEXT=$(find build \
+          codesign -dvvv "$KEXT" \
+            2>&1 \
+            | tee -a diagnostics/codesign.txt \
+            || true
+
+          echo "===== KEXT INFO =====" \
+            | tee diagnostics/kext-info.txt
+
+          kmutil inspect \
+            -b "$KEXT" \
+            2>&1 \
+            | tee -a diagnostics/kext-info.txt \
+            || true
+
+      - name: Prepare ownership and permissions
+        run: |
+          sudo chown -R root:wheel "$KEXT"
+
+          sudo find "$KEXT" \
             -type d \
-            -name "AirportItlwm.kext" \
-            | head -1)
+            -exec chmod 755 {} \;
 
-          cp -R "$KEXT" artifacts/
+          sudo find "$KEXT" \
+            -type f \
+            -exec chmod 644 {} \;
 
-          cp xcodebuild.log artifacts/
-          cp compiler-errors.txt artifacts/
-          cp generated-kexts.txt artifacts/
-          cp -R analysis artifacts/
+          sudo chmod 755 "$BIN"
+
+      - name: Run kextutil validation
+        continue-on-error: true
+        run: |
+          echo "===== KEXTUTIL VALIDATION =====" \
+            | tee diagnostics/kextutil.txt
+
+          sudo kextutil \
+            -v 6 \
+            "$KEXT" \
+            2>&1 \
+            | tee -a diagnostics/kextutil.txt
+
+      - name: Run kmutil load diagnostic
+        continue-on-error: true
+        run: |
+          echo "===== KMUTIL LOAD =====" \
+            | tee diagnostics/kmutil-load.txt
+
+          sudo kmutil load \
+            -p "$KEXT" \
+            2>&1 \
+            | tee -a diagnostics/kmutil-load.txt
+
+      - name: Check kmutil result for linker failures
+        run: |
+          echo "===== LINKER FAILURE SEARCH =====" \
+            | tee diagnostics/linker-check.txt
+
+          grep -Ei \
+            "Failed to bind|could not find a kext which exports this symbol|undefined symbol|linking|KMErrorDomain|Code=31|Code=30" \
+            diagnostics/kmutil-load.txt \
+            diagnostics/kextutil.txt \
+            | tee -a diagnostics/linker-check.txt \
+            || true
+
+      - name: Save build logs
+        if: always()
+        run: |
+          cp xcodebuild.log diagnostics/ || true
+
+          find build \
+            -type d \
+            -name "*.kext" \
+            -print \
+            > diagnostics/generated-kexts.txt \
+            || true
+
+      - name: Package validation result
+        if: always()
+        run: |
+          mkdir -p artifact
+
+          cp -R "$KEXT" artifact/ || true
+          cp -R diagnostics artifact/
 
           ditto \
             -c \
             -k \
             --sequesterRsrc \
             --keepParent \
-            artifacts \
-            AirportItlwm-Sequoia-ABI-test.zip
+            artifact \
+            AirportItlwm-Sequoia-validation.zip
 
-      - name: Upload successful build
-        if: success()
+      - name: Upload validation artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: AirportItlwm-Sequoia-ABI-test
-          path: AirportItlwm-Sequoia-ABI-test.zip
-
-      - name: Upload failed diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: AirportItlwm-Sequoia-build-logs
-          path: |
-            xcodebuild.log
-            compiler-errors.txt
-            generated-kexts.txt
+          name: AirportItlwm-Sequoia-validation
+          path: AirportItlwm-Sequoia-validation.zip
